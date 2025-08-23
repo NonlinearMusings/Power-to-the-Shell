@@ -5,7 +5,7 @@
     
 .DESCRIPTION
     This script manages Windows user privileges by interacting with the Local Security Authority (LSA)
-    through Windows API calls. It provides functionality to grant and verify user privileges such as
+    through Windows API calls. It provides functionality to grant, revoke and verify user privileges such as
     "Log on as a service" rights.
 
 .NOTES
@@ -17,13 +17,25 @@
 # Check if the custom LsaWrapper type is already loaded in the current PowerShell session
 # This prevents "type already exists" errors when running the script multiple times
 if (-not ("LsaWrapper" -as [type])) {
-    # Define the C# source code as a here-string for compilation into PowerShell
-    $source = `
-@"
+    # Define the C# source code as a single-quoted here-string to avoid PowerShell variable expansion
+    $source = @'
 // Import required .NET namespaces for Windows API interop and security operations
 using System;                          // Core system types and functionality
-using System.Runtime.InteropServices;  // Platform invoke (P/Invoke) for calling Windows APIs
+using System.Runtime.InteropServices;  // P/Invoke declarations and interop helpers
 using System.Security.Principal;       // Windows security principals and SID handling
+
+// Compatibility shim: some runtimes used by PowerShell Core do not expose System.ComponentModel.Win32Exception
+// in a referenced assembly at compile time. Provide a minimal implementation so code can throw/inspect it.
+namespace System.ComponentModel
+{
+    public class Win32Exception : Exception
+    {
+        public int NativeErrorCode { get; private set; }
+        public Win32Exception() : base() { NativeErrorCode = 0; }
+        public Win32Exception(string message) : base(message) { NativeErrorCode = 0; }
+        public Win32Exception(int error) : base("Win32 error " + error) { NativeErrorCode = error; }
+    }
+}
 
 // Main wrapper class for Local Security Authority (LSA) operations
 // Provides managed .NET methods to interact with Windows LSA APIs
@@ -57,7 +69,11 @@ public class LsaWrapper
     #endregion
     
     #region Windows API Function Imports
-    
+
+    // NOTE: LSA functions return NTSTATUS values (not Win32 GetLastError values).
+    // When an LSA API returns a non-zero NTSTATUS, convert it with LsaNtStatusToWinError
+    // before creating a Win32Exception or reporting a Win32 error code to the caller.
+
     // Opens a handle to the Local Security Authority (LSA) policy database
     // Required before performing any privilege operations
     [DllImport("advapi32.dll", SetLastError = true)]
@@ -84,6 +100,16 @@ public class LsaWrapper
         byte[] sid,                            // User's Security Identifier (SID) as byte array
         out IntPtr userRights,                 // Receives pointer to array of privileges
         out int count);                        // Receives count of privileges
+
+    // Removes privileges/rights from a user account in the LSA database
+    // Signature includes a BOOLEAN removeAll parameter; when TRUE all rights are removed.
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern int LsaRemoveAccountRights(
+        IntPtr policyHandle,                            // LSA policy handle from LsaOpenPolicy
+        byte[] sid,                                     // User's Security Identifier (SID) as byte array
+        [MarshalAs(UnmanagedType.U1)] bool removeAll,   // Whether to remove ALL rights (TRUE) or the provided rights array (FALSE)
+        LSA_UNICODE_STRING[] userRights,                // Array of privilege names to remove
+        int count);                                     // Number of privileges in the array
 
     // Closes an LSA policy handle and releases associated resources
     // Must be called to prevent resource leaks
@@ -122,113 +148,188 @@ public class LsaWrapper
         // Allocate unmanaged memory for the Unicode string
         // StringToHGlobalUni creates a null-terminated Unicode string in unmanaged memory
         IntPtr ptr = Marshal.StringToHGlobalUni(s);
-        
+
         // Create and return the LSA_UNICODE_STRING structure
+        // NOTE: The unmanaged buffer returned in LSA_UNICODE_STRING.Buffer must be freed by the caller
+        // (for example via Marshal.FreeHGlobal) after the structure has been used by native APIs.
         return new LSA_UNICODE_STRING
         {
             Buffer = ptr,                                           // Pointer to the string data
-            Length = (ushort)(s.Length * sizeof(char)),            // String length in bytes (Unicode = 2 bytes per char)
+            Length = (ushort)(s.Length * sizeof(char)),             // String length in bytes (Unicode = 2 bytes per char)
             MaximumLength = (ushort)((s.Length + 1) * sizeof(char)) // Buffer size including null terminator
         };
+    }
+
+    // Create exceptions that include both the raw NTSTATUS (hex) and the converted Win32 message.
+    // This aids diagnostics when LSA returns NTSTATUS codes that are otherwise opaque.
+    private static System.ComponentModel.Win32Exception MakeLsaException(int ntstatus)
+    {
+        int win32 = LsaNtStatusToWinError(ntstatus);
+        string winMsg = new System.ComponentModel.Win32Exception(win32).Message;
+        string msg = string.Format("LSA NTSTATUS 0x{0:X8} -> Win32 {1} ({2})", ntstatus, win32, winMsg);
+        return new System.ComponentModel.Win32Exception(msg);
     }
     
     #endregion
     
     #region Public Methods
 
-    // Grants a specific privilege to a user account
-    // Returns true if successful, false if failed
-    public static bool GrantPrivilege(string accountName, string privilege)
+    // Grant a user account a specific privilege.
+    public static bool GrantPrivilege(string accountName, string privilege, bool verbose = false, string errorAction = "Continue")
     {
+        bool throwOnError = verbose || string.Equals(errorAction, "Stop", StringComparison.OrdinalIgnoreCase);
+
         // Initialize LSA_OBJECT_ATTRIBUTES structure with default values
-        // This structure defines attributes for the LSA policy object
         LSA_OBJECT_ATTRIBUTES attributes = new LSA_OBJECT_ATTRIBUTES();
         attributes.Length = Marshal.SizeOf(typeof(LSA_OBJECT_ATTRIBUTES)); // Set structure size
-        
+
         // Create empty system name structure (indicates local system)
-        // Non-null values would target remote systems
         LSA_UNICODE_STRING systemName = new LSA_UNICODE_STRING
         {
-            Buffer = IntPtr.Zero,    // No system name = local system
-            Length = 0,              // Zero length
-            MaximumLength = 0        // Zero maximum length
+            Buffer = IntPtr.Zero,
+            Length = 0,
+            MaximumLength = 0
         };
 
         // Define access rights for the LSA policy handle
-        // POLICY_ALL_ACCESS (0x000F0FFF) provides full access to policy operations
         uint access = 0x000F0FFF; // POLICY_ALL_ACCESS constant
-        
-        // Declare variable to receive the policy handle
-        IntPtr policyHandle;
-        
-        // Attempt to open the LSA policy database
-        // This must succeed before any privilege operations can be performed
-        int result = LsaOpenPolicy(ref systemName, ref attributes, access, out policyHandle);
-        
-        // Check if LsaOpenPolicy failed (non-zero return value indicates failure)
-        if (result != 0)
-            return false; // Return failure if we can't open the policy
 
-        // Use try-finally to ensure proper cleanup of the policy handle
+        IntPtr policyHandle;
+        int result = LsaOpenPolicy(ref systemName, ref attributes, access, out policyHandle);
+
+        // Surface or return based on throwOnError
+        if (result != 0)
+        {
+            if (throwOnError)
+                throw MakeLsaException(result);
+            return false;
+        }
+
         try
         {
-            // Nested try-catch for account resolution and privilege assignment
+            // Resolve account to SID
+            NTAccount account = new NTAccount(accountName);
+            SecurityIdentifier sid = (SecurityIdentifier)account.Translate(typeof(SecurityIdentifier));
+
+            byte[] sidBytes = new byte[sid.BinaryLength];
+            sid.GetBinaryForm(sidBytes, 0);
+
+            // Prepare the privilege name for the LSA API call
+            LSA_UNICODE_STRING[] userRights = new LSA_UNICODE_STRING[1];
+            userRights[0] = InitLsaString(privilege);
+
+            // Ensure unmanaged string is freed even if the API call fails
             try
             {
-                // Convert the account name to a Security Identifier (SID)
-                // Windows internally works with SIDs rather than account names
-                NTAccount account = new NTAccount(accountName);                        // Create NTAccount object from name
-                SecurityIdentifier sid = (SecurityIdentifier)account.Translate(typeof(SecurityIdentifier)); // Convert to SID
-                
-                // Convert SID to byte array format required by LSA APIs
-                byte[] sidBytes = new byte[sid.BinaryLength];  // Allocate byte array of correct size
-                sid.GetBinaryForm(sidBytes, 0);                // Copy SID binary data to array
+                result = LsaAddAccountRights(policyHandle, sidBytes, userRights, 1);
 
-                // Prepare the privilege name for the LSA API call
-                // LSA APIs require an array of LSA_UNICODE_STRING structures
-                LSA_UNICODE_STRING[] userRights = new LSA_UNICODE_STRING[1]; // Create array for one privilege
-                userRights[0] = InitLsaString(privilege);                    // Convert privilege name to LSA format
-
-                // Nested try-finally to ensure memory cleanup for the privilege string
-                try
-                    // Call the LSA API to add the privilege to the user account
-                    // This is the core operation that actually grants the privilege
-                    result = LsaAddAccountRights(policyHandle, sidBytes, userRights, 1);
-                    
-                    // Return success status: true if result is 0 (success), false otherwise
-                    return result == 0;
-                }
-                finally
+                if (result != 0)
                 {
-                    // Critical cleanup: Free the allocated string memory to prevent memory leaks
-                    // The InitLsaString method allocated unmanaged memory that must be freed
-                    if (userRights[0].Buffer != IntPtr.Zero)
-                        Marshal.FreeHGlobal(userRights[0].Buffer); // Free the Unicode string buffer
+                    if (throwOnError)
+                        throw MakeLsaException(result);
+                    return false;
                 }
+
+                return true;
             }
-            catch
+            finally
             {
-                // If any exception occurs during the privilege grant operation, return failure
-                // This catches issues like invalid account names, privilege names, or API failures
-                return false;
+                if (userRights[0].Buffer != IntPtr.Zero)
+                    Marshal.FreeHGlobal(userRights[0].Buffer);
             }
         }
         finally
         {
             // Always close the LSA policy handle to release system resources
-            // This is critical to prevent resource leaks in the LSA subsystem
             LsaClose(policyHandle);
         }
     }
 
-    // Checks if a user account has a specific privilege
-    // Returns true if the privilege is assigned, false otherwise
-    public static bool HasPrivilege(string accountName, string privilege)
+    // Revoke a user account's specific privilege.
+    public static bool RevokePrivilege(string accountName, string privilege, bool verbose = false, string errorAction = "Continue")
     {
+        bool throwOnError = verbose || string.Equals(errorAction, "Stop", StringComparison.OrdinalIgnoreCase);
+
         // Initialize LSA_OBJECT_ATTRIBUTES structure for policy access
         LSA_OBJECT_ATTRIBUTES attributes = new LSA_OBJECT_ATTRIBUTES();
         attributes.Length = Marshal.SizeOf(typeof(LSA_OBJECT_ATTRIBUTES)); // Set structure size
-        
+
+        // Create empty system name structure for local system access
+        LSA_UNICODE_STRING systemName = new LSA_UNICODE_STRING
+        {
+            Buffer = IntPtr.Zero,
+            Length = 0,
+            MaximumLength = 0
+        };
+
+        // Define access rights for removal operations (use POLICY_ALL_ACCESS)
+        uint access = 0x000F0FFF; // POLICY_ALL_ACCESS constant
+
+        IntPtr policyHandle;
+        int result = LsaOpenPolicy(ref systemName, ref attributes, access, out policyHandle);
+
+        if (result != 0)
+        {
+            if (throwOnError)
+                throw MakeLsaException(result);
+            return false;
+        }
+
+        try
+        {
+            // Resolve account to SID
+            NTAccount account = new NTAccount(accountName);
+            SecurityIdentifier sid = (SecurityIdentifier)account.Translate(typeof(SecurityIdentifier));
+
+            byte[] sidBytes = new byte[sid.BinaryLength];
+            sid.GetBinaryForm(sidBytes, 0);
+
+            LSA_UNICODE_STRING[] userRights = new LSA_UNICODE_STRING[1];
+            userRights[0] = InitLsaString(privilege);
+
+            try
+            {
+                // Pass 'false' for removeAll so we remove only the specified right(s)
+                result = LsaRemoveAccountRights(policyHandle, sidBytes, false, userRights, 1);
+
+                if (result != 0)
+                {
+                    // Map NTSTATUS -> Win32 and consider 'not found' (Win32 2) as success
+                    int win32 = LsaNtStatusToWinError(result);
+                    if (win32 == 2) // ERROR_FILE_NOT_FOUND -> privilege not present
+                    {
+                        return true;
+                    }
+
+                    if (throwOnError)
+                        throw MakeLsaException(result);
+                    return false;
+                }
+
+                return true;
+            }
+            finally
+            {
+                if (userRights[0].Buffer != IntPtr.Zero)
+                    Marshal.FreeHGlobal(userRights[0].Buffer);
+            }
+        }
+        finally
+        {
+            // Always close the LSA policy handle
+            LsaClose(policyHandle);
+        }
+    }
+
+    // Verify a user account's specific privilege.
+    public static bool HasPrivilege(string accountName, string privilege, bool verbose = false, string errorAction = "Continue")
+    {
+        bool throwOnError = verbose || string.Equals(errorAction, "Stop", StringComparison.OrdinalIgnoreCase);
+
+        // Initialize LSA_OBJECT_ATTRIBUTES structure for policy access
+        LSA_OBJECT_ATTRIBUTES attributes = new LSA_OBJECT_ATTRIBUTES();
+        attributes.Length = Marshal.SizeOf(typeof(LSA_OBJECT_ATTRIBUTES)); // Set structure size
+
         // Create empty system name structure for local system access
         LSA_UNICODE_STRING systemName = new LSA_UNICODE_STRING
         {
@@ -238,97 +339,87 @@ public class LsaWrapper
         };
 
         // Define access rights for privilege enumeration
-        // POLICY_LOOKUP_NAMES (0x00000800) allows querying account privileges
         uint access = 0x00000800; // POLICY_LOOKUP_NAMES constant
-        
-        // Declare variable to receive the policy handle
-        IntPtr policyHandle;
-        
-        // Attempt to open the LSA policy with lookup access
-        int result = LsaOpenPolicy(ref systemName, ref attributes, access, out policyHandle);
-        
-        // If policy open fails, throw an exception with the Windows error code
-        if (result != 0)
-            throw new System.ComponentModel.Win32Exception(LsaNtStatusToWinError(result));
 
-        // Use try-finally to ensure proper cleanup of the policy handle
+        IntPtr policyHandle;
+
+        int result = LsaOpenPolicy(ref systemName, ref attributes, access, out policyHandle);
+
+        if (result != 0)
+        {
+            if (throwOnError)
+                throw MakeLsaException(result);
+            return false;
+        }
+
         try
         {
             // Convert the account name to a Security Identifier (SID)
-            NTAccount account = new NTAccount(accountName);                        // Create NTAccount from name
-            SecurityIdentifier sid = (SecurityIdentifier)account.Translate(typeof(SecurityIdentifier)); // Convert to SID
-            
-            // Convert SID to byte array format for LSA API
-            byte[] sidBytes = new byte[sid.BinaryLength];  // Allocate byte array
-            sid.GetBinaryForm(sidBytes, 0);                // Copy SID binary data
+            NTAccount account = new NTAccount(accountName);
+            SecurityIdentifier sid = (SecurityIdentifier)account.Translate(typeof(SecurityIdentifier));
 
-            // Declare variables to receive privilege enumeration results
-            IntPtr userRightsPtr = IntPtr.Zero; // Will receive pointer to privilege array
-            int count;                          // Will receive count of privileges
-            
-            // Enumerate all privileges currently assigned to the user
+            // Convert SID to byte array format for LSA API
+            byte[] sidBytes = new byte[sid.BinaryLength];
+            sid.GetBinaryForm(sidBytes, 0);
+
+            IntPtr userRightsPtr = IntPtr.Zero;
+            int count;
+
             result = LsaEnumerateAccountRights(policyHandle, sidBytes, out userRightsPtr, out count);
-            
-            // Use try-finally to ensure cleanup of LSA-allocated memory
+
             try
             {
-                // Check if enumeration succeeded and returned privilege data
                 if (result == 0 && userRightsPtr != IntPtr.Zero)
                 {
-                    // Initialize pointer for iterating through the privilege array
                     IntPtr current = userRightsPtr;
-                    
-                    // Loop through each privilege in the returned array
+
                     for (int i = 0; i < count; i++)
                     {
-                        // Marshal the current array element to LSA_UNICODE_STRING structure
                         LSA_UNICODE_STRING right = (LSA_UNICODE_STRING)Marshal.PtrToStructure(current, typeof(LSA_UNICODE_STRING));
-                        
-                        // Check if the privilege has valid string data
+
                         if (right.Buffer != IntPtr.Zero)
                         {
-                            // Convert the LSA Unicode string to a .NET string
-                            // Divide length by 2 because Length is in bytes, not characters
                             string rightName = Marshal.PtrToStringUni(right.Buffer, right.Length / 2);
-                            
-                            // Check if this privilege matches the one we're looking for
                             if (rightName == privilege)
-                                return true; // Found the privilege
+                                return true;
                         }
-                        
-                        // Move to the next privilege in the array
+
                         current = IntPtr.Add(current, Marshal.SizeOf(typeof(LSA_UNICODE_STRING)));
                     }
                 }
-                
-                // If we reach here, the privilege was not found in the user's privilege list
+
                 return false;
             }
             finally
             {
-                // Critical cleanup: Free the memory allocated by LsaEnumerateAccountRights
-                // This prevents memory leaks in the LSA subsystem
                 if (userRightsPtr != IntPtr.Zero)
                 {
-                    LsaFreeMemory(userRightsPtr); // Free the privilege array memory
+                    LsaFreeMemory(userRightsPtr);
                 }
             }
         }
         finally
         {
-            // Always close the LSA policy handle to release system resources
             LsaClose(policyHandle);
         }
     }
-    
     #endregion
 }
-"@
+'@
 
     # Compile the C# source code into the PowerShell session
     # Add-Type creates a .NET assembly from the source code and loads it into the current AppDomain
     # ReferencedAssemblies parameter specifies additional .NET assemblies required by the code
-    Add-Type -TypeDefinition $source -ReferencedAssemblies "System.Security", "System.DirectoryServices"
+    try {
+        Add-Type -TypeDefinition $source -ReferencedAssemblies "System.Security", "System.DirectoryServices", "System.Security.Principal.Windows" -ErrorAction Stop
+    }
+    catch {
+        Write-Error "Failed to compile LsaWrapper C# code: $($_.Exception.Message)"
+        if ($_.Exception.InnerException) {
+            Write-Error "Inner exception: $($_.Exception.InnerException.Message)"
+        }
+        throw
+    }
 }
 #endregion
 
@@ -337,20 +428,47 @@ public class LsaWrapper
 # $env:USERNAME contains the currently logged-in user's username
 $user = $env:USERNAME
 
-# Define the privilege to be granted
-# SeServiceLogonRight = "Log on as a service" privilege
-# Other common privileges: SeBackupPrivilege, SeRestorePrivilege, SeShutdownPrivilege, etc.
-$privilege = "SeServiceLogonRight"
-#endregion
+# Recommended Se* privileges for SQL Server service accounts
+# Adjust this list as needed for your environment
+$privileges = @(
+    "SeServiceLogonRight",            # Log on as a service
+    "SeImpersonatePrivilege",         # Impersonate a client after authentication
+    "SeAssignPrimaryTokenPrivilege",  # Replace a process-level token
+    "SeIncreaseQuotaPrivilege",       # Adjust memory quotas for a process
+    "SeCreateGlobalPrivilege"         # Create global objects
+)
 
-#region User Interface and Information Display
+# User Interface and Information Display
 Clear-Host
-Write-Host "Attempting to grant privilege '$privilege' to user '$user'..."
+Write-Host "Attempting to grant configured SQL Server privileges to user '$user'... (Verbose LSA errors: $($VerbosePreference -eq 'Continue'))"
 Write-Host "Current computer: $env:COMPUTERNAME" -ForegroundColor Gray  # Show computer name
 Write-Host "Current user: $(whoami)" -ForegroundColor Gray              # Show current user context
 #endregion
 
 #region Administrator Privilege Verification
+# Compute per-call preferences using PowerShell defaults
+# $callVerbose is driven by -Verbose.
+# $callErrorAction will be passed to the C# methods; if set to 'Stop' those methods will throw on LSA failures.
+$callVerbose = ($VerbosePreference -eq 'Continue')
+$callErrorAction = $ErrorActionPreference.ToString()
+
+# Examples:
+# * Force verbose and treat LSA errors as terminating (useful for debugging):
+#   $callVerbose = $true
+#   $callErrorAction = 'Stop'
+#
+# * Show verbose details but do not throw (continue on errors):
+#   $callVerbose = $true
+#   $callErrorAction = 'SilentlyContinue'
+#
+# * Do not show verbose output but convert errors to terminating:
+#   $callVerbose = $false
+#   $callErrorAction = 'Stop'
+#
+# * Explicitly ignore errors (not recommended in production):
+#   $callVerbose = $false
+#   $callErrorAction = 'SilentlyContinue'
+
 # Get the current user's Windows identity
 # WindowsIdentity represents the Windows user account context
 $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -400,31 +518,28 @@ try {
     #endregion
     
     #region Privilege Grant Execution
-    # Call the LsaWrapper class method to grant the privilege
-    # GrantPrivilege returns true for success, false for failure
-    $result = [LsaWrapper]::GrantPrivilege($user, $privilege)
-    
-    # Check the result and display appropriate success message
-    if ($result) {
-        Write-Host "Successfully granted privilege '$privilege' to user '$user'." -ForegroundColor Green
+    # Call the LsaWrapper class method to grant each configured privilege
+    foreach ($privilege in $privileges) {
+        Write-Host "\nProcessing privilege: $privilege" -ForegroundColor Cyan
+
+        $granted = [LsaWrapper]::GrantPrivilege($user, $privilege, $callVerbose, $callErrorAction)
+        if ($granted) {
+            Write-Host "Successfully granted privilege '$privilege' to user '$user'." -ForegroundColor Green
+        } else {
+            Write-Host "Failed to grant privilege '$privilege' to user '$user'." -ForegroundColor Yellow
+        }
+
+        # Verification
+        Write-Host "Verifying privilege assignment for '$privilege'..." -ForegroundColor Cyan
+        $has = [LsaWrapper]::HasPrivilege($user, $privilege, $callVerbose, $callErrorAction)
+        if ($has) {
+            Write-Host "User '$user' now has the privilege '$privilege'" -ForegroundColor Green
+        } else {
+            Write-Host "Could not verify privilege assignment for '$privilege'" -ForegroundColor Red
+        }
     }
     #endregion
-    
-    #region Privilege Verification
-    Write-Host ""
-    Write-Host "Verifying privilege assignment..." -ForegroundColor Cyan
-    
-    # Call the LsaWrapper class method to verify the privilege was granted
-    # HasPrivilege returns true if the privilege is assigned, false otherwise
-    $result = [LsaWrapper]::HasPrivilege($user, $privilege)
-    
-    # Display verification results with appropriate color coding
-    if ($result) {
-        Write-Host "User '$user' now has the privilege '$privilege'" -ForegroundColor Green
-    } else {
-        Write-Host "Could not verify privilege assignment" -ForegroundColor Red
-    }
-    #endregion
+
 } 
 catch {
     #region Error Handling
@@ -432,5 +547,35 @@ catch {
     Write-Error "Failed to grant privilege: $($_.Exception.Message)"
     exit 1
     #endregion
+}
+#endregion
+
+#region Demonstration: Revoke (optional)
+# This demonstration will attempt to revoke the privileges that were just granted.
+# It is intentionally opt-in and requires typing the exact string 'YES' to proceed.
+$answer = Read-Host "Do you want to demonstrate revoking the privileges we just attempted? Type 'YES' to proceed"
+if ($answer -eq 'YES') {
+    # Demonstration revoke block uses the same per-call preferences
+    foreach ($privilege in $privileges) {
+        Write-Host "Attempting to revoke privilege '$privilege' from user '$user'..." -ForegroundColor Cyan
+
+        $revoked = [LsaWrapper]::RevokePrivilege($user, $privilege, $callVerbose, $callErrorAction)
+        if ($revoked) {
+            Write-Host "Successfully revoked privilege '$privilege' from user '$user'." -ForegroundColor Green
+        } else {
+            Write-Host "Failed to revoke privilege '$privilege' from user '$user'." -ForegroundColor Yellow
+        }
+
+        # Verification
+        Write-Host "Verifying removal of '$privilege'..." -ForegroundColor Cyan
+        $stillHas = [LsaWrapper]::HasPrivilege($user, $privilege, $callVerbose, $callErrorAction)
+        if (-not $stillHas) {
+            Write-Host "Verified: user '$user' no longer has '$privilege'." -ForegroundColor Green
+        } else {
+            Write-Host "User '$user' still has '$privilege'." -ForegroundColor Red
+        }
+    }
+} else {
+    Write-Host "Skipping revoke demonstration." -ForegroundColor Gray
 }
 #endregion
